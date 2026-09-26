@@ -1,0 +1,120 @@
+# Infrastructure Pipeline: validate, plan, approve, then apply the reviewed plan.
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/*
+
+pr: none
+
+pool:
+  name: oluwagbade-selfhosted-pool
+
+variables:
+  - group: epicbook # mysql_admin_password (secret), ssh_allowed_cidrs
+  - name: azureServiceConnection
+    value: 'azure-epicbook-rg'
+  - name: tfDir
+    value: '$(System.DefaultWorkingDirectory)/terraform'
+  - name: TF_IN_AUTOMATION
+    value: 'true'
+  - name: TF_INPUT
+    value: 'false'
+
+stages:
+  - stage: Validate
+    displayName: Validate
+    jobs:
+      - job: Validate
+        displayName: Format check and validate
+        steps:
+          - checkout: self
+            clean: true
+          - bash: |
+              set -euo pipefail
+              echo "Submitted by: Oluwagbade Odimayo"
+              terraform version
+              cd "$(tfDir)"
+              terraform fmt -check -recursive
+              terraform init -backend=false
+              terraform validate
+            displayName: terraform fmt, init (no backend) and validate
+
+  - stage: Plan
+    displayName: Plan
+    dependsOn: Validate
+    jobs:
+      - job: Plan
+        displayName: Create the reviewed plan
+        steps:
+          - checkout: self
+            clean: true
+          - task: DownloadSecureFile@1
+            name: sshPub
+            displayName: Download the VM public key (secure file)
+            inputs:
+              secureFile: epicbook-week10.pub
+          - task: AzureCLI@2
+            displayName: terraform init and plan
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                # Register the subscription ID as a secret so Azure DevOps masks it in resource IDs below
+                echo "##vso[task.setvariable variable=maskedSubscriptionId;issecret=true]${ARM_SUBSCRIPTION_ID}"
+                export ARM_SUBSCRIPTION_ID
+                cd "$(tfDir)"
+                terraform init
+                terraform plan -out=tfplan -var "admin_ssh_public_key=$(cat "$(sshPub.secureFilePath)")"
+                mkdir -p "$(Build.ArtifactStagingDirectory)/tfplan"
+                cp tfplan "$(Build.ArtifactStagingDirectory)/tfplan/tfplan"
+                cp .terraform.lock.hcl "$(Build.ArtifactStagingDirectory)/tfplan/terraform.lock.hcl"
+            env:
+              TF_VAR_mysql_admin_password: $(mysql_admin_password)
+              TF_VAR_ssh_allowed_cidrs: $(ssh_allowed_cidrs)
+          - task: PublishPipelineArtifact@1
+            displayName: Publish the plan for the Apply stage
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/tfplan
+              artifact: tfplan
+
+  - stage: Apply
+    displayName: Apply
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: Apply
+        displayName: Apply the reviewed plan
+        environment: epicbook-infra # approval check configured on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+                - download: current
+                  artifact: tfplan
+                  displayName: Download the reviewed plan
+                - task: AzureCLI@2
+                  displayName: terraform apply (reviewed plan) and outputs
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                      # Register the subscription ID as a secret so Azure DevOps masks it in resource IDs below
+                      echo "##vso[task.setvariable variable=maskedSubscriptionId;issecret=true]${ARM_SUBSCRIPTION_ID}"
+                      export ARM_SUBSCRIPTION_ID
+                      cd "$(tfDir)"
+                      cp "$(Pipeline.Workspace)/tfplan/terraform.lock.hcl" .terraform.lock.hcl
+                      terraform init
+                      terraform apply "$(Pipeline.Workspace)/tfplan/tfplan"
+                      echo "===== Non-sensitive outputs for the manual Ansible handoff ====="
+                      terraform output
